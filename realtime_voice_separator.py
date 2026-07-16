@@ -15,31 +15,60 @@ import torch
 from scipy.signal import resample_poly
 
 MODEL_SR = 16000
-# Keep 0.5s windows (faster on MPS). Hop matches window so emit stays realtime.
-# Seam blend does not hold back samples (holding back caused underrun glitches).
-WINDOW_SEC = 0.5
-HOP_SEC = 0.5
+
+# --- Analysis window vs. emit hop -----------------------------------------
+# MossFormer2 is NOT causal/streaming: it separates whatever chunk of audio
+# you hand it using only that chunk's own content. ClearVoice's own offline
+# inference path pads short clips up to ~2s before decoding for exactly this
+# reason. Below that, separation quality drops sharply (thin, warbly,
+# "robotic" output), and the two output stems get split inconsistently from
+# one chunk to the next — which is also what makes the A/B identity lock
+# keep flip-flopping, since there's nothing consistent for it to lock onto.
+#
+# WINDOW_SEC gives the model real context (>= ClearVoice's own ~2s minimum).
+# The hop controls how often we emit audio: each inference call reprocesses
+# the last WINDOW_SEC of audio, but only the newest hop-sized tail of the
+# result is ever emitted — that tail gets (WINDOW_SEC - hop) seconds of
+# left-context "for free", which is what fixes the distortion, while
+# emission still happens every hop.
+#
+# Pacing: every hop costs a WINDOW_SEC-long forward pass, so one inference
+# must produce at least as much audio as it takes to compute, or playback
+# starves (that's exactly the "plays a second, pauses a second" symptom).
+# Both numbers below are just STARTING points — the app auto-adapts at
+# runtime in two stages, cheapest first:
+#   1) grow the hop toward the window. Same per-call cost, but each call
+#      now emits more audio, so less reused left-context but no quality
+#      change to the window itself.
+#   2) if the hop has already grown to equal the window (zero left-context,
+#      i.e. plain sequential chunking) and inference is STILL slower than
+#      that, shrink the window itself, down to MIN_WINDOW_SEC. This lowers
+#      the absolute cost of each call — the only lever left once hop can't
+#      grow any further. Some separation quality is traded for staying
+#      gapless, but only as much as the hardware actually forces.
+WINDOW_SEC = 2.0
+HOP_SEC = 0.5          # starting hop; grows toward WINDOW_SEC if needed
+MIN_WINDOW_SEC = 1.0   # floor for stage 2 — ClearVoice's own ~1-2s minimum
+WINDOW_SHRINK_FACTOR = 0.8
 CROSSFADE_SEC = 0.06
-WINDOW_SAMPLES = int(WINDOW_SEC * MODEL_SR)
-HOP_SAMPLES = int(HOP_SEC * MODEL_SR)
+WINDOW_SAMPLES = int(WINDOW_SEC * MODEL_SR)          # starting point only
+HOP_SAMPLES = int(HOP_SEC * MODEL_SR)                # starting point only
+MIN_WINDOW_SAMPLES = int(MIN_WINDOW_SEC * MODEL_SR)
 CROSSFADE_SAMPLES = int(CROSSFADE_SEC * MODEL_SR)
+assert WINDOW_SAMPLES >= HOP_SAMPLES, "WINDOW_SEC must be >= HOP_SEC"
+assert MIN_WINDOW_SAMPLES >= CROSSFADE_SAMPLES * 4, "MIN_WINDOW_SEC too small"
 BLOCK_SEC = 0.05
 PLAYBACK_READY_SEC = 1.25
-PLAYBACK_FLOOR_SEC = 0.0
 OUTPUT_GAIN = 0.40
-TRACK_TAIL_SEC = 0.4
-TRACK_TAIL = int(TRACK_TAIL_SEC * MODEL_SR)
 SWAP_MARGIN = 0.55
-SWAP_CONFIRM = 5
 QUIET_RMS = 0.018
 HARD_LOCK_AFTER = 4
-SWITCH_MUTE_SEC = 0.0
 
 MODEL_NAME = "MossFormer2_SS_16K"
 
 
 def load_model():
-    """Load ClearVoice speech separation model; return SpeechModel wrapper."""
+    """Load ClearVoice speech separation model; return (model, warmup_seconds)."""
     from clearvoice import ClearVoice
 
     print(
@@ -50,13 +79,31 @@ def load_model():
     speech_model = separator.models[0]
     speech_model.model.eval()
     print(f"Model loaded on {speech_model.device}.")
+    # Two warmup passes: the first includes one-time graph/dispatch overhead
+    # and badly overestimates steady-state cost — time the second.
     dummy = torch.zeros(1, WINDOW_SAMPLES, device=speech_model.device)
-    with torch.inference_mode():
-        _ = speech_model.model(dummy)
-        if speech_model.device.type == "mps":
-            torch.mps.synchronize()
-    print("Warmup done.")
-    return speech_model
+    warmup_s = 0.0
+    for _ in range(2):
+        t0 = time.perf_counter()
+        with torch.inference_mode():
+            _ = speech_model.model(dummy)
+            if speech_model.device.type == "mps":
+                torch.mps.synchronize()
+        warmup_s = time.perf_counter() - t0
+    print(
+        f"Warmup done: one {WINDOW_SEC:.2f}s window took {warmup_s:.2f}s. "
+        "Hop/window will auto-tune at runtime so each inference produces "
+        "more audio than it costs (no dropouts)."
+    )
+    if warmup_s > WINDOW_SEC:
+        print(
+            f"WARNING: inference ({warmup_s:.2f}s/window) is slower than "
+            f"the window itself ({WINDOW_SEC:.2f}s) — even fully-sequential, "
+            "zero-context chunking can't keep up yet. The app will keep "
+            f"shrinking the window at runtime (down to a {MIN_WINDOW_SEC:.2f}s "
+            "floor) until it can."
+        )
+    return speech_model, warmup_s
 
 
 class RateConverter:
@@ -149,25 +196,32 @@ def _corr(x, y):
     return float(np.dot(a, b) / (da * db))
 
 
-def _spectral_fingerprint(x, n_fft=1024, n_bands=48):
-    """Band-averaged log-magnitude spectrum — stable speaker identity cue."""
+def _spectral_fingerprint(x, n_fft=1024, n_bands=48, max_frames=16):
+    """Band-averaged log-magnitude spectrum — stable speaker identity cue.
+
+    Samples frames evenly across the WHOLE input rather than clustering at
+    the very start, so the fingerprint reflects a speaker's timbre over the
+    full window instead of whatever happened to be in the first ~200ms (a
+    breath, a plosive, silence). With the longer analysis window this now
+    covers a couple of seconds of speech, giving a much more stable identity
+    cue than before.
+    """
     x = np.asarray(x, dtype=np.float32)
     if x.size < n_fft:
         x = np.pad(x, (0, n_fft - x.size))
-    # Average a couple of hops inside the window for stability.
-    hop = n_fft // 2
+    usable = len(x) - n_fft
+    if usable <= 0:
+        starts = [0]
+    else:
+        n_frames = max(1, min(max_frames, usable // (n_fft // 4) + 1))
+        starts = np.linspace(0, usable, n_frames).astype(int)
     mags = []
-    for start in range(0, max(1, len(x) - n_fft + 1), hop):
+    for start in starts:
         frame = x[start : start + n_fft]
         if len(frame) < n_fft:
-            break
+            frame = np.pad(frame, (0, n_fft - len(frame)))
         spec = np.fft.rfft(frame * np.hanning(n_fft))
         mags.append(np.abs(spec).astype(np.float64))
-        if len(mags) >= 4:
-            break
-    if not mags:
-        spec = np.fft.rfft(x[:n_fft] * np.hanning(n_fft))
-        mags = [np.abs(spec).astype(np.float64)]
     mag = np.mean(mags, axis=0)
     # Collapse to coarse bands (speaker timbre, less phonetic detail).
     edges = np.linspace(0, len(mag), n_bands + 1).astype(int)
@@ -344,7 +398,10 @@ def _boost_stem(x, gain=OUTPUT_GAIN, ceiling=0.65):
 def _separate_window(speech_model, window, mix_peak):
     """Direct model forward — skips ClearVoice's 2s padding decode path."""
     device = speech_model.device
-    window_norm = (window / mix_peak).astype(np.float32)
+    # mix_peak is now a slow-moving reference (see processing_loop), so a
+    # sudden loud transient can briefly exceed it — clip so the model always
+    # sees audio in its expected [-1, 1] range.
+    window_norm = np.clip(window / mix_peak, -1.0, 1.0).astype(np.float32)
     audio = torch.from_numpy(window_norm[None, :]).to(device)
     with torch.inference_mode():
         out_list = speech_model.model(audio)
@@ -361,8 +418,27 @@ def _separate_window(speech_model, window, mix_peak):
 
 class AudioApp:
     def __init__(self):
-        self.speech_model = load_model()
+        self.speech_model, warmup_s = load_model()
         self.tracker = SpeakerTracker()
+
+        # --- Adaptive window/hop (see comment block near the top of the
+        # file). window_samples/hop_samples are mutable instance state —
+        # processing_loop grows hop toward window first, then shrinks the
+        # window itself if that alone isn't enough.
+        self.window_sec = WINDOW_SEC
+        self.window_samples = WINDOW_SAMPLES
+        self.hop_samples = HOP_SAMPLES
+        self._infer_ema = warmup_s
+        # Fast-forward stage 1 immediately using the warmup measurement
+        # instead of waiting several live windows to discover it.
+        if warmup_s > (self.hop_samples / MODEL_SR) * 0.85:
+            # Seed hop from the measured cost directly (with 5% headroom),
+            # capped at the window (zero left-context is the floor here).
+            self.hop_samples = min(self.window_samples, int(warmup_s * 1.05 * MODEL_SR))
+            print(
+                f"Auto-tuned emit hop to {self.hop_samples / MODEL_SR:.2f}s "
+                f"(inference measured at {warmup_s:.2f}s per {WINDOW_SEC:.2f}s window)."
+            )
 
         self.selected = "A"
         self.selected_lock = threading.Lock()
@@ -380,6 +456,7 @@ class AudioApp:
         self.playback_ready = False
         self._needs_refill = False
         self._switch_mute_until = 0.0
+        self._first_window = True
 
         self.input_sr = MODEL_SR
         self.output_sr = MODEL_SR
@@ -389,12 +466,15 @@ class AudioApp:
         self._model_sr_buffer = np.zeros(0, dtype=np.float32)
         self._fade_tail_a = None
         self._fade_tail_b = None
+        self._norm_ref = 0.05
 
         self.stats_lock = threading.Lock()
         self.stats = {
             "in_rms": 0.0,
             "out_rms": 0.0,
             "infer_s": 0.0,
+            "hop_s": self.hop_samples / MODEL_SR,
+            "window_s": self.window_sec,
             "windows": 0,
             "swaps": 0,
             "buf_s": 0.0,
@@ -482,58 +562,124 @@ class AudioApp:
 
             self._model_sr_buffer = np.concatenate([self._model_sr_buffer, model_audio])
 
-            # If inference fell behind, drop old mic audio so we stay near-live
-            # instead of processing a long backlog of stale windows in a burst.
-            max_buf = WINDOW_SAMPLES + HOP_SAMPLES * 2
+            # Last resort only: if inference fell badly behind, drop the
+            # oldest mic audio so we stay near-live instead of processing a
+            # long backlog of stale windows. With the adaptive hop this
+            # should essentially never fire.
+            max_buf = self.window_samples + self.hop_samples * 3
             if len(self._model_sr_buffer) > max_buf:
+                dropped = len(self._model_sr_buffer) - max_buf
                 self._model_sr_buffer = self._model_sr_buffer[-max_buf:]
+                print(f"note: dropped {dropped / MODEL_SR:.2f}s of mic backlog")
 
-            # Only run another separation if playback cushion needs audio.
-            with self._playback_lock:
-                buffered = len(self._playback_buf)
-            queued = self.out_queue.qsize()
-            # Rough output seconds already waiting.
-            out_wait = buffered / max(self.output_sr, 1) + queued * HOP_SEC
-            if out_wait > PLAYBACK_READY_SEC * 1.4 and len(self._model_sr_buffer) >= WINDOW_SAMPLES:
-                # Healthy buffer — trim mic backlog and wait.
-                if len(self._model_sr_buffer) > WINDOW_SAMPLES:
-                    self._model_sr_buffer = self._model_sr_buffer[-WINDOW_SAMPLES:]
-                continue
+            # Steady-state pacing is automatic: each window consumes one hop
+            # of mic input and emits one hop of output, and mic input arrives
+            # at exactly real-time — so this inner loop naturally runs once
+            # per hop. (The old "healthy buffer" throttle here was TRIMMING
+            # mic audio while the cushion looked full, which punched holes in
+            # the input and caused the periodic pause/glitch cycle.)
+            while self.running and len(self._model_sr_buffer) >= self.window_samples:
+                # Snapshot this iteration's window/hop up front: they may be
+                # adapted (below) for the *next* iteration once we know how
+                # long this inference took, but this window must stay
+                # internally consistent from slicing through padding.
+                window_samples_now = self.window_samples
+                hop = self.hop_samples  # hop used for THIS window
+                window = self._model_sr_buffer[:window_samples_now]
+                self._model_sr_buffer = self._model_sr_buffer[hop:]
 
-            while len(self._model_sr_buffer) >= WINDOW_SAMPLES:
-                window = self._model_sr_buffer[:WINDOW_SAMPLES]
-                self._model_sr_buffer = self._model_sr_buffer[HOP_SAMPLES:]
-
-                mix_peak = float(np.max(np.abs(window)) + 1e-8)
+                cur_peak = float(np.max(np.abs(window)) + 1e-8)
                 # Avoid insane gain on near-silence (noise → robotic bursts).
-                mix_peak = max(mix_peak, 0.02)
+                cur_peak = max(cur_peak, 0.02)
+                # Smooth the normalization reference across windows instead of
+                # using each window's own instantaneous peak. Normalizing
+                # (and then rescaling) every window independently made the
+                # output gain visibly "pump" between chunks — a big part of
+                # what reads as robotic/distorted.
+                norm_alpha = 0.15
+                self._norm_ref = (1 - norm_alpha) * self._norm_ref + norm_alpha * cur_peak
+                mix_peak = max(self._norm_ref, 0.02)
 
                 t0 = time.perf_counter()
                 src0, src1 = _separate_window(self.speech_model, window, mix_peak)
                 infer_s = time.perf_counter() - t0
-                if infer_s > HOP_SEC * 1.05:
-                    print(
-                        f"note: inference {infer_s:.2f}s > hop {HOP_SEC:.2f}s "
-                        "(dropping backlog rather than glitching)"
-                    )
 
-                n = min(len(src0), len(src1), WINDOW_SAMPLES)
+                # Two-stage adaptation: track average inference cost, and if
+                # it creeps toward the hop budget, first grow the hop toward
+                # the window (cheap — same inference cost, less reused
+                # context); only if the hop has already reached the window
+                # (zero context) and we're STILL behind do we shrink the
+                # window itself (the only remaining lever — it directly cuts
+                # the absolute cost of each call). Both take effect on the
+                # NEXT iteration; this one already consumed `hop`/`window_samples_now`.
+                if self._infer_ema is None:
+                    self._infer_ema = infer_s
+                else:
+                    self._infer_ema = 0.7 * self._infer_ema + 0.3 * infer_s
+                hop_sec_now = hop / MODEL_SR
+                behind = self._infer_ema > hop_sec_now * 0.85
+
+                if behind and self.hop_samples < self.window_samples:
+                    self.hop_samples = min(
+                        self.window_samples, int(self.hop_samples * 1.3)
+                    )
+                    print(
+                        f"note: inference averaging {self._infer_ema:.2f}s/window — "
+                        f"raising emit hop {hop_sec_now:.2f}s → "
+                        f"{self.hop_samples / MODEL_SR:.2f}s "
+                        f"(window {self.window_sec:.2f}s) to stay seamless"
+                    )
+                elif behind and self.window_samples > MIN_WINDOW_SAMPLES:
+                    new_window_samples = max(
+                        MIN_WINDOW_SAMPLES,
+                        int(self.window_samples * WINDOW_SHRINK_FACTOR),
+                    )
+                    if new_window_samples < self.window_samples:
+                        self.window_samples = new_window_samples
+                        self.window_sec = self.window_samples / MODEL_SR
+                        self.hop_samples = self.window_samples  # zero-context
+                        self._infer_ema = None  # re-measure fresh at new size
+                        print(
+                            f"note: even zero-context chunking is behind — "
+                            f"shrinking window to {self.window_sec:.2f}s "
+                            "(slightly reduces separation quality, but keeps "
+                            "playback gapless)"
+                        )
+
+                n = min(len(src0), len(src1), window_samples_now)
                 src0 = src0[:n]
                 src1 = src1[:n]
-                if n < WINDOW_SAMPLES:
-                    pad = WINDOW_SAMPLES - n
+                if n < window_samples_now:
+                    pad = window_samples_now - n
                     src0 = np.pad(src0, (0, pad))
                     src1 = np.pad(src1, (0, pad))
 
                 stream_a, stream_b, swapped = self.tracker.align(src0, src1)
-                stream_a = _boost_stem(stream_a)
-                stream_b = _boost_stem(stream_b)
+
+                # Only the newest hop-sized tail is new audio — everything
+                # before it in this window was already emitted (with less
+                # context) by a previous iteration. Emitting just the tail,
+                # now backed by the rest of the window as left-context, is
+                # what gets us both realtime cadence and non-causal-model
+                # separation quality.
+                #
+                # Exception: the very FIRST window emits in full. Nothing was
+                # emitted before it, so its head isn't a duplicate — and the
+                # full-window emit instantly fills the playback cushion to
+                # ~WINDOW_SEC, so all buffering happens once at startup.
+                if self._first_window:
+                    self._first_window = False
+                    tail_a = _boost_stem(stream_a)
+                    tail_b = _boost_stem(stream_b)
+                else:
+                    tail_a = _boost_stem(stream_a[-hop:])
+                    tail_b = _boost_stem(stream_b[-hop:])
 
                 new_a, self._fade_tail_a = _emit_with_crossfade(
-                    self._fade_tail_a, stream_a, CROSSFADE_SAMPLES
+                    self._fade_tail_a, tail_a, CROSSFADE_SAMPLES
                 )
                 new_b, self._fade_tail_b = _emit_with_crossfade(
-                    self._fade_tail_b, stream_b, CROSSFADE_SAMPLES
+                    self._fade_tail_b, tail_b, CROSSFADE_SAMPLES
                 )
 
                 with self.selected_lock:
@@ -542,6 +688,8 @@ class AudioApp:
                 out_chunk = self.out_resampler.convert(chosen.astype(np.float32))
                 with self.stats_lock:
                     self.stats["infer_s"] = infer_s
+                    self.stats["hop_s"] = self.hop_samples / MODEL_SR
+                    self.stats["window_s"] = self.window_sec
                     self.stats["windows"] += 1
                     if swapped:
                         self.stats["swaps"] += 1
@@ -554,13 +702,6 @@ class AudioApp:
                     self.out_queue.put(out_chunk, timeout=2.0)
                 except queue.Full:
                     print("note: output queue full — skipping window")
-
-                # One window per mic read keeps pacing stable; loop again only
-                # if the cushion is critically low.
-                with self._playback_lock:
-                    buffered = len(self._playback_buf)
-                if buffered / max(self.output_sr, 1) + self.out_queue.qsize() * HOP_SEC > 0.35:
-                    break
 
     def set_selected(self, choice):
         with self.selected_lock:
@@ -616,6 +757,9 @@ class AudioApp:
         self._model_sr_buffer = np.zeros(0, dtype=np.float32)
         self._fade_tail_a = None
         self._fade_tail_b = None
+        self._norm_ref = 0.05
+        self._first_window = True
+        # Keep the learned hop across restarts — it reflects this hardware.
 
         self._drain_playback()
         while not self.raw_queue.empty():
@@ -707,8 +851,9 @@ def build_gui(app: AudioApp):
         if app.listening:
             meters.set(
                 f"mic: {s['in_rms']:.3f}   out: {s['out_rms']:.3f}   "
-                f"infer: {s['infer_s']:.2f}s   buf: {s['buf_s']:.2f}s   "
-                f"flips~{s['swaps']}   pause~{s['paused']}"
+                f"infer: {s['infer_s']:.2f}s   win: {s['window_s']:.2f}s   "
+                f"hop: {s['hop_s']:.2f}s   "
+                f"buf: {s['buf_s']:.2f}s   flips~{s['swaps']}   pause~{s['paused']}"
             )
         root.after(200, poll_stats)
 
