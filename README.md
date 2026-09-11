@@ -1,18 +1,9 @@
 # Real-Time Two-Speaker Toggle with ClearVoice
 
-Listen to your microphone with two overlapping voices, and toggle which
-speaker you hear, live — powered by
+PROTOTYPE -- TWO SPEAKER TOGGLE
+Run from computer
+
 [ClearerVoice-Studio](https://github.com/modelscope/ClearerVoice-Studio)
-(`MossFormer2_SS_16K`).
-
-## About the model
-
-This app uses ClearVoice’s pretrained speech-separation model:
-
-- Model: `MossFormer2_SS_16K`
-- Task: `speech_separation` (fixed at 2 speakers, 16 kHz)
-- Install: `pip install clearvoice` — weights download automatically on first run
-  from HuggingFace into ClearVoice’s checkpoint cache
 
 ## Requirements
 
